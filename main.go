@@ -22,6 +22,9 @@ type secretManager struct {
 }
 
 func getAWSSecretValue(svc *secretsmanager.SecretsManager, secretID string) (map[string]string, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("secret manager not configured")
+	}
 	input := &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretID),
 	}
@@ -40,6 +43,9 @@ func getAWSSecretValue(svc *secretsmanager.SecretsManager, secretID string) (map
 }
 
 func newAWSSecretsManagerClient(accessKeyID, secretKey, region string) (*secretsmanager.SecretsManager, error) {
+	if accessKeyID == "" || secretKey == "" || region == "" {
+		return nil, nil
+	}
 	sess, err := session.NewSession(&aws.Config{
 		Region:      aws.String(region),
 		Credentials: credentials.NewStaticCredentials(accessKeyID, secretKey, ""),
@@ -50,18 +56,71 @@ func newAWSSecretsManagerClient(accessKeyID, secretKey, region string) (*secrets
 	return secretsmanager.New(sess), nil
 }
 
+type secretProviderType string
+
+const (
+	// fetch secrets from aws secrets manager
+	secretProviderAWSSecretsManager secretProviderType = "aws"
+	// fetches secrets from environment variables mapped as json in unix environments
+	secretProviderEnvJSON secretProviderType = "envjson"
+)
+
 type valAttr struct {
-	provider  string
-	secretID  string
-	secretKey string
+	smService *secretsmanager.SecretsManager
 }
 
-func parseAWSConnectionVal(val string) (*valAttr, error) {
-	parts := strings.SplitN(val, ":", 3)
-	if len(parts) < 3 {
-		return nil, fmt.Errorf("failed parsing connection value, want=provider:secret-id:key, got=%s", val)
+func newValAttr(pluginEnvVars map[string]string) (*valAttr, error) {
+	if len(pluginEnvVars) > 0 {
+		keyid, _ := base64.StdEncoding.DecodeString(pluginEnvVars["AWS_ACCESS_KEY_ID"])
+		skey, _ := base64.StdEncoding.DecodeString(pluginEnvVars["AWS_SECRET_ACCESS_KEY"])
+		region, _ := base64.StdEncoding.DecodeString(pluginEnvVars["AWS_REGION"])
+		svc, err := newAWSSecretsManagerClient(string(keyid), string(skey), string(region))
+		if err != nil {
+			return nil, err
+		}
+		return &valAttr{smService: svc}, nil
 	}
-	return &valAttr{parts[0], parts[1], parts[2]}, nil
+	return &valAttr{}, nil
+}
+
+// <provider>:<secret-id>:<secret-key>
+func (a *valAttr) parseConnectionVal(val string) (string, error) {
+	parts := strings.Split(val, ":")
+	if len(parts) != 3 {
+		return "", nil
+	}
+	secretProvider, secretID, secretKey := secretProviderType(parts[0]), parts[1], parts[2]
+	switch secretProvider {
+	case secretProviderAWSSecretsManager:
+		if a.smService == nil {
+			return "", fmt.Errorf("secret manager is missing required aws credentials")
+		}
+		keyVal, err := getAWSSecretValue(a.smService, secretID)
+		if err != nil {
+			return "", fmt.Errorf("failed to get %s/%s, err=%v", secretID, secretKey, err)
+		}
+		secretVal, ok := keyVal[secretKey]
+		if !ok {
+			return "", fmt.Errorf("key not found, secretid=%s, secretkey=%s",
+				secretID, secretKey)
+		}
+		return string(secretVal), nil
+	case secretProviderEnvJSON:
+		envJson := os.Getenv(secretID)
+		if envJson == "" {
+			return "", fmt.Errorf("env not found for secret id %q", secretID)
+		}
+		var envMap map[string]string
+		if err := json.Unmarshal([]byte(envJson), &envMap); err != nil {
+			return "", fmt.Errorf("failed decoding secret id %q to json, err=%v", secretID, err)
+		}
+		val, ok := envMap[secretKey]
+		if !ok {
+			return "", fmt.Errorf("secret key %q not found in secret id %q", secretKey, secretID)
+		}
+		return val, nil
+	}
+	return "", fmt.Errorf("secret provider %q not implemented", secretProvider)
 }
 
 func (s *secretManager) logRedactVal(envKey string, val string) {
@@ -73,19 +132,10 @@ func (s *secretManager) logRedactVal(envKey string, val string) {
 }
 
 func (s *secretManager) secretManagerGetter(params *pluginhooks.SesssionParams) (map[string]any, error) {
-	keyid, _ := base64.StdEncoding.DecodeString(params.PluginEnvVars["AWS_ACCESS_KEY_ID"])
-	skey, _ := base64.StdEncoding.DecodeString(params.PluginEnvVars["AWS_SECRET_ACCESS_KEY"])
-	region, _ := base64.StdEncoding.DecodeString(params.PluginEnvVars["AWS_REGION"])
-	var svc *secretsmanager.SecretsManager
-	if keyid == nil || skey == nil || region == nil {
-		return nil, fmt.Errorf("missing aws credentials")
-	}
-	svc, err := newAWSSecretsManagerClient(string(keyid), string(skey), string(region))
+	attrInstance, err := newValAttr(params.PluginEnvVars)
 	if err != nil {
 		return nil, err
 	}
-
-	secretKeyVal := map[string]map[string]string{}
 	var responseConnEnvVar map[string]any
 	for envKey, val := range params.ConnectionEnvVars {
 		encVal, ok := val.(string)
@@ -100,31 +150,14 @@ func (s *secretManager) secretManagerGetter(params *pluginhooks.SesssionParams) 
 		if responseConnEnvVar == nil {
 			responseConnEnvVar = map[string]any{}
 		}
-		attr, err := parseAWSConnectionVal(string(decVal))
+		secretVal, err := attrInstance.parseConnectionVal(string(decVal))
 		if err != nil {
 			return nil, err
 		}
-		if attr.provider != "aws" {
-			return nil, fmt.Errorf("provider '%s' not implement", attr.provider)
+		if secretVal == "" {
+			s.logger.Debug("bypassing", "key", envKey)
+			continue
 		}
-		if keyVal, ok := secretKeyVal[attr.secretID]; ok {
-			if val, ok := keyVal[attr.secretKey]; ok {
-				s.logRedactVal(envKey, val)
-				responseConnEnvVar[envKey] = base64.StdEncoding.EncodeToString([]byte(val))
-				continue
-			}
-		}
-
-		keyVal, err := getAWSSecretValue(svc, attr.secretID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get %s/%s, err=%v", envKey, decVal, err)
-		}
-		secretVal, ok := keyVal[attr.secretKey]
-		if !ok {
-			return nil, fmt.Errorf("key not found, secretid=%s, secretkey=%s, envkey=%s",
-				attr.secretID, attr.secretKey, envKey)
-		}
-		secretKeyVal[attr.secretID] = keyVal
 		s.logRedactVal(envKey, secretVal)
 		responseConnEnvVar[envKey] = base64.StdEncoding.EncodeToString([]byte(secretVal))
 	}
@@ -158,10 +191,16 @@ func (s *secretManager) OnSend(req *pluginhooks.Request, resp *pluginhooks.Respo
 }
 
 func main() {
+	logLevel := "info"
+	if strings.ToLower(os.Getenv("LOG_LEVEL")) == "debug" {
+		logLevel = "debug"
+	}
 	logger := hclog.New(&hclog.LoggerOptions{
-		Level:  hclog.Info,
-		Output: os.Stderr,
+		Level:             hclog.LevelFromString(logLevel),
+		Output:            os.Stderr,
+		DisableTime:       true,
+		IndependentLevels: true,
 	})
-	logger.Debug("starting plugin secretmanager")
+	logger.Info("starting plugin secretmanager")
 	pluginhooks.Serve(&secretManager{logger: logger})
 }
