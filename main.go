@@ -69,7 +69,7 @@ func (a *valAttr) parseConnectionVal(val string) (string, error) {
 			return "", fmt.Errorf("key not found, secretid=%s, secretkey=%s",
 				secretID, secretKey)
 		}
-		return string(secretVal), nil
+		return fmt.Sprintf("%v", secretVal), nil
 	case secretProviderEnvJSON:
 		envJson := os.Getenv(secretID)
 		if envJson == "" {
@@ -183,7 +183,7 @@ func (w *awsLogger) Write(b []byte) (int, error) {
 	return 0, nil
 }
 
-func getAWSSecretValue(svc *secretsmanager.Client, secretID string) (map[string]string, error) {
+func getAWSSecretValue(svc *secretsmanager.Client, secretID string) (map[string]any, error) {
 	if svc == nil {
 		return nil, fmt.Errorf("secret manager not configured")
 	}
@@ -194,9 +194,9 @@ func getAWSSecretValue(svc *secretsmanager.Client, secretID string) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	var keyValSecret map[string]string
+	var keyValSecret map[string]any
 	if err := json.Unmarshal([]byte(*result.SecretString), &keyValSecret); err != nil {
-		return nil, fmt.Errorf("failed deserializing secret key/val")
+		return nil, fmt.Errorf("failed deserializing secret key/val, err=%v", err)
 	}
 	return keyValSecret, nil
 }
