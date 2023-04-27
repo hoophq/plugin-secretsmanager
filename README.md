@@ -1,14 +1,8 @@
 # Plugin Secrets Manager
 
-This plugin integrates with most secrets manager out there.
+This plugin integrates with external secrets manager
 
-## AWS Secrets Manager
-
-**Required Configuration**
-
-- AWS_ACCESS_KEY_ID
-- AWS_SECRET_ACCESS_KEY
-- AWS_REGION
+[Secret Manager Plugin Doc](https://hoop.dev/docs/plugins/secrets-manager)
 
 ## Publishing
 
