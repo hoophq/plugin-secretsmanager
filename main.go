@@ -1,59 +1,26 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/smithy-go/logging"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hoophq/pluginhooks"
 )
 
 type secretManager struct {
-	logger hclog.Logger
-	params *pluginhooks.SesssionParams
-}
-
-func getAWSSecretValue(svc *secretsmanager.SecretsManager, secretID string) (map[string]string, error) {
-	if svc == nil {
-		return nil, fmt.Errorf("secret manager not configured")
-	}
-	input := &secretsmanager.GetSecretValueInput{
-		SecretId: aws.String(secretID),
-	}
-	result, err := svc.GetSecretValue(input)
-	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			return nil, fmt.Errorf("code=%s, err=%s", aerr.Code(), aerr)
-		}
-		return nil, err
-	}
-	var keyValSecret map[string]string
-	if err := json.Unmarshal([]byte(*result.SecretString), &keyValSecret); err != nil {
-		return nil, fmt.Errorf("failed deserializing secret key/val")
-	}
-	return keyValSecret, nil
-}
-
-func newAWSSecretsManagerClient(accessKeyID, secretKey, region string) (*secretsmanager.SecretsManager, error) {
-	if accessKeyID == "" || secretKey == "" || region == "" {
-		return nil, nil
-	}
-	sess, err := session.NewSession(&aws.Config{
-		Region:      aws.String(region),
-		Credentials: credentials.NewStaticCredentials(accessKeyID, secretKey, ""),
-	})
-	if err != nil {
-		return nil, err
-	}
-	return secretsmanager.New(sess), nil
+	logger    hclog.Logger
+	awsLogger *awsLogger
+	params    *pluginhooks.SesssionParams
 }
 
 type secretProviderType string
@@ -66,21 +33,19 @@ const (
 )
 
 type valAttr struct {
-	smService *secretsmanager.SecretsManager
+	smService *secretsmanager.Client
 }
 
-func newValAttr(pluginEnvVars map[string]string) (*valAttr, error) {
-	if len(pluginEnvVars) > 0 {
-		keyid, _ := base64.StdEncoding.DecodeString(pluginEnvVars["AWS_ACCESS_KEY_ID"])
-		skey, _ := base64.StdEncoding.DecodeString(pluginEnvVars["AWS_SECRET_ACCESS_KEY"])
-		region, _ := base64.StdEncoding.DecodeString(pluginEnvVars["AWS_REGION"])
-		svc, err := newAWSSecretsManagerClient(string(keyid), string(skey), string(region))
-		if err != nil {
-			return nil, err
-		}
-		return &valAttr{smService: svc}, nil
+func newValAttr(pluginEnvVars map[string]string, wLogger io.Writer) (*valAttr, error) {
+	cfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		return nil, err
 	}
-	return &valAttr{}, nil
+	svc := secretsmanager.NewFromConfig(cfg, func(o *secretsmanager.Options) {
+		o.ClientLogMode = aws.LogSigning | aws.LogRequest | aws.LogResponseWithBody
+		o.Logger = logging.NewStandardLogger(wLogger)
+	})
+	return &valAttr{smService: svc}, nil
 }
 
 // <provider>:<secret-id>:<secret-key>
@@ -132,7 +97,18 @@ func (s *secretManager) logRedactVal(envKey string, val string) {
 }
 
 func (s *secretManager) secretManagerGetter(params *pluginhooks.SesssionParams) (map[string]any, error) {
-	attrInstance, err := newValAttr(params.PluginEnvVars)
+	s.logger.Debug("plugin env vars", "length", len(params.PluginEnvVars))
+	for key, val := range params.PluginEnvVars {
+		decVal, err := base64.StdEncoding.DecodeString(val)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode plugin config key %v, err=%v", key, err)
+		}
+		s.logger.Debug("setting env", "key", key, "val-length", len(decVal))
+		if err := os.Setenv(key, string(decVal)); err != nil {
+			return nil, fmt.Errorf("failed configuring plugin config env %v, err=%v", key, err)
+		}
+	}
+	attrInstance, err := newValAttr(params.PluginEnvVars, s.awsLogger)
 	if err != nil {
 		return nil, err
 	}
@@ -190,17 +166,58 @@ func (s *secretManager) OnSend(req *pluginhooks.Request, resp *pluginhooks.Respo
 	return nil
 }
 
+type awsLogger struct {
+	logger hclog.Logger
+}
+
+func (w *awsLogger) Write(b []byte) (int, error) {
+	if w.logger != nil && b != nil {
+		w.logger.Debug(string(b), "lib", "aws")
+	}
+	return 0, nil
+}
+
+func getAWSSecretValue(svc *secretsmanager.Client, secretID string) (map[string]string, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("secret manager not configured")
+	}
+	input := &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(secretID),
+	}
+	result, err := svc.GetSecretValue(context.Background(), input)
+	if err != nil {
+		return nil, err
+	}
+	var keyValSecret map[string]string
+	if err := json.Unmarshal([]byte(*result.SecretString), &keyValSecret); err != nil {
+		return nil, fmt.Errorf("failed deserializing secret key/val")
+	}
+	return keyValSecret, nil
+}
+
 func main() {
-	logLevel := "info"
-	if strings.ToLower(os.Getenv("LOG_LEVEL")) == "debug" {
-		logLevel = "debug"
+	logLevel := strings.ToLower(os.Getenv("LOG_LEVEL"))
+	hcLogLevel := hclog.Info
+	switch logLevel {
+	case "debug", "trace":
+		hcLogLevel = hclog.Debug
+	default:
+		hcLogLevel = hclog.Info
 	}
 	logger := hclog.New(&hclog.LoggerOptions{
-		Level:             hclog.LevelFromString(logLevel),
+		Level:             hcLogLevel,
 		Output:            os.Stderr,
 		DisableTime:       true,
 		IndependentLevels: true,
+		JSONFormat:        true,
 	})
-	logger.Info("starting plugin secretmanager")
-	pluginhooks.Serve(&secretManager{logger: logger})
+	awslogger := &awsLogger{logger: nil}
+	if logLevel == "trace" {
+		awslogger.logger = logger
+	}
+	logger.Info("starting plugin secretmanager", "awslogger", logLevel == "trace")
+	pluginhooks.Serve(&secretManager{
+		logger:    logger,
+		awsLogger: awslogger,
+	})
 }
