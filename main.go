@@ -151,8 +151,14 @@ func (s *secretManager) OnSessionOpen(params *pluginhooks.SesssionParams, resp *
 		s.logger.Info("empty connection envvars", "session", params.SessionID)
 		return nil
 	}
-
-	resp.ConnectionEnvVars = connectionEnvVars
+	resp.ConnectionEnvVars = params.ConnectionEnvVars
+	if resp.ConnectionEnvVars == nil {
+		resp.ConnectionEnvVars = map[string]any{}
+	}
+	// add or replace any env variable found
+	for key, val := range connectionEnvVars {
+		resp.ConnectionEnvVars[key] = val
+	}
 	return nil
 }
 
